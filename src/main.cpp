@@ -18,14 +18,14 @@
 // Global Variables (Mostly to fix screen ratio issues)
 int screenSizeX = 800;
 int screenSizeY = 600;
-int scaleCoefficent = 100; //pixels per "unit"
-float gravity = -9.8f * scaleCoefficent;
-float particleRadius = 3.2f;
-int particles = 6000;
+int scaleCoefficent = 400; //pixels per "unit"
+float gravity = -9.8f * 40;
+float particleRadius = 1.8f;
+int particles = 8000;
 bool frozen = false;
 
 // Uniform grid for simulation
-float smoothingRadius = 20.0f;
+float smoothingRadius = 40.0f;
 int gridSize = (int) smoothingRadius;
 int cellsX = screenSizeX / gridSize; // 100
 int cellsY = screenSizeY / gridSize; // 75
@@ -48,7 +48,7 @@ float restitution = 0.2f;
 float stiffness = (float) scaleCoefficent * 0.9f;
 float correction = 0.001f;
 std::vector<glm::vec2> ghostCell;
-float mouseForce = 80.0f;
+float mouseForce = 5.0f / scaleCoefficent;
 
 std::random_device seed;
 std::mt19937 gen{seed()};
@@ -58,7 +58,7 @@ std::uniform_int_distribution<> disty{10, 590};
 std::vector<glm::vec2> generateGhostCell()
 {
     std::vector<glm::vec2> ghostPositions;
-    int ghostCount = 80;
+    int ghostCount = 100;
     int ghostPerRow = (int)sqrt(ghostCount);
     float ghostSpacing = gridSize / (float)ghostPerRow;
 
@@ -175,14 +175,14 @@ int main()
     glfwSwapInterval(0);
 
     // Create vertex and fragment shaders
-    std::string vertexCode = readFile("src/shaders/vertexShader.glsl");
+    std::string vertexCode = readFile("project/src/shaders/vertexShader.glsl");
     const char* vertexShaderSource = vertexCode.c_str();
     unsigned int vertexShader;
     vertexShader = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
     glCompileShader(vertexShader);
 
-    std::string fragmentCode = readFile("src/shaders/fragmentShader.glsl");
+    std::string fragmentCode = readFile("project/src/shaders/fragmentShader.glsl");
     const char* fragmentShaderSource = fragmentCode.c_str();
     unsigned int fragmentShader;
     fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
@@ -204,7 +204,7 @@ int main()
     // Object Context
     {
         // Particle Creation
-        ParticleManager particleManager = ParticleManager(15);
+        ParticleManager particleManager = ParticleManager(6);
         // Declare object manager
         std::vector<std::unique_ptr<Particle>>& objectArray = particleManager.objects;
 
@@ -258,8 +258,18 @@ int main()
         const float minTime = 1.0f / 120.0f;
 
         // SPH Setup
+        std::vector<glm::vec3> ddn(particles, glm::vec3(0.0f)); // density, distance, neighbors
+        std::vector<glm::vec3> accel(particles, glm::vec3(0.0f));
+        std::vector<glm::vec3> sumRs(particles, glm::vec3(0.0f));
+
         area = 10.0f / (M_PI * smoothingRadius * smoothingRadius); // 2D normalization
         ghostCell = generateGhostCell();
+
+        const int neighborOffsets[9][2] = {
+            {-1,-1},{-1,0},{-1,1},
+            {0,-1}, {0,0}, {0,1},
+            {1,-1}, {1,0}, {1,1}
+        };
 
         // Main Loop
         while(!glfwWindowShouldClose(window))
@@ -288,6 +298,7 @@ int main()
                 // Reset grid
                 for (auto& cell : grid) cell.clear();
                 generateGrid(objectArray);
+                
 
                 // Handle Cursor interactions
                 if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
@@ -297,65 +308,93 @@ int main()
                     mouseY = screenSizeY - mouseY;
                 }
 
-                // Calculate the densities
+                // Calculate the densities (Symmetric to save compute time)
+                std::fill(ddn.begin(), ddn.end(), glm::vec3(0.0f));
+                std::fill(accel.begin(), accel.end(), glm::vec3(0.0f));
+                std::fill(sumRs.begin(), sumRs.end(), glm::vec3(0.0f));
+
                 for (int p = 0; p < objectArray.size(); p++)
                 {
-                    auto& object = objectArray[p];
-                    auto& A = *object;
-                    A.acceleration = glm::vec3(0.0f);
+                    auto& A = *objectArray[p];
                     int gridX = std::clamp(static_cast<int>(A.position.x / gridSize), 0, cellsX - 1);
                     int gridY = std::clamp(static_cast<int>(A.position.y / gridSize), 0, cellsY - 1);
-                    float density = 0.0f;
-                    glm::vec3 acceleration = glm::vec3(0.0f);
-                    float sumDist = 0.0f;
-                    glm::vec3 sumR = glm::vec3(0.0f);
-                    int neighborCount = 0;
-                    for (int i = -1; i < 2; i++) {
-                        for (int j = -1; j < 2; j++) {
-                            if (gridX + i >= 0 && gridX + i < cellsX && gridY + j >= 0 && gridY + j < cellsY)
-                            {
-                                int key = (gridX + i) + (gridY + j) * cellsX;
-                                for (auto& c : grid[key]) {
-                                    auto& B = *objectArray[c];
-                                    glm::vec3 normal = A.position - B.position;
-                                    float distance = glm::length(normal);
-                                    if (distance < smoothingRadius && distance > 0.00001f)
-                                    {
-                                        density += calculateDensity(distance, B.mass);
-                                        acceleration += calculateGradient(distance, B.mass) * normal;
-                                        sumDist += distance;
-                                        sumR += normal;
-                                        neighborCount++;
-                                    }
+
+                    for (auto& [dx, dy] : neighborOffsets) {
+                        if (gridX + dx >= 0 && gridX + dx < cellsX && gridY + dy >= 0 && gridY + dy < cellsY)
+                        {
+                            int key = (gridX + dx) + (gridY + dy) * cellsX;
+                            for (auto& c : grid[key]) {
+                                if (dx == 0 && dy == 0 && p <= c || key > gridX + gridY * cellsX) continue;
+                                auto& B = *objectArray[c];
+                                glm::vec3 normal = A.position - B.position;
+                                float distance = glm::length(normal);
+                                if (distance < smoothingRadius && distance > 0.00001f)
+                                {
+                                    glm::vec3 densDistNeighbors = glm::vec3(calculateDensity(distance, B.mass), distance, 1);
+                                    glm::vec3 acceleration = calculateGradient(distance, B.mass) * normal;
+                                    ddn[p] += densDistNeighbors;
+                                    ddn[c] += densDistNeighbors;
+                                    accel[p] += acceleration;
+                                    accel[c] -= acceleration;
+                                    sumRs[p] += normal;
+                                    sumRs[c] -= normal;
                                 }
                             }
-                            else
-                            {
-                                float offsetX = (gridX + i) * gridSize;
-                                float offsetY = (gridY + j) * gridSize;
-
-                                for (auto& ghostOffset : ghostCell) {
-                                    glm::vec3 normal = A.position - glm::vec3(offsetX + ghostOffset.x, offsetY + ghostOffset.y, 0.0f);
-                                    float distance = glm::length(normal);
-                                    if (distance < smoothingRadius && distance > 0.00001f)
-                                    {
-                                        density += calculateDensity(distance, A.mass);
-                                        acceleration += calculateGradient(distance, A.mass) * normal;
-                                        sumDist += distance;
-                                        sumR += normal;
-                                        neighborCount++;
-                                    }
+                        }
+                        else
+                        {
+                            float offsetX = (gridX + dx) * gridSize;
+                            float offsetY = (gridY + dy) * gridSize;
+                            for (auto& ghostOffset : ghostCell) {
+                                glm::vec3 normal = A.position - glm::vec3(offsetX + ghostOffset.x, offsetY + ghostOffset.y, 0.0f);
+                                float distance = glm::length(normal);
+                                if (distance < smoothingRadius && distance > 0.00001f)
+                                {
+                                    ddn[p] += glm::vec3(calculateDensity(distance, A.mass), distance, 1);
+                                    accel[p] += calculateGradient(distance, A.mass) * normal;
+                                    sumRs[p] += normal;
                                 }
                             }
                         }
                     }
-                    // Calculating Pressure
+                }
+
+                // Mouse Interactions
+                if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
+                {
+                    double mouseX, mouseY;
+                    glfwGetCursorPos(window, &mouseX, &mouseY);
+                    mouseY = screenSizeY - mouseY;
+                    glm::vec3 mousePos = glm::vec3((float) mouseX, (float) mouseY, 0.0f);
+                    int gridX = (int)(mouseX / gridSize);
+                    int gridY = (int)(mouseY / gridSize);
+
+                    for (auto& [dx, dy] : neighborOffsets) {
+                        if (gridX + dx >= 0 && gridX + dx < cellsX && gridY + dy >= 0 && gridY + dy < cellsY) {
+                            int gridKey = (int) ((mouseX + dx) / gridSize) + (int) ((mouseY + dy) / gridSize) * cellsX;
+                            for (auto& c : grid[gridKey]) {
+                                glm::vec3 direction = glm::normalize(mousePos - (*objectArray[c]).position);
+                                accel[c] += mouseForce * direction;
+                            }
+                        }
+                    }
+                }
+
+                // Update Accelerations
+                for (int p = 0; p < objectArray.size(); p++)
+                {
+                    auto& A = *objectArray[p];
+                    float density = ddn[p].x;
+                    float sumDist = ddn[p].y;
+                    int neighborCount = (float) ddn[p].z;
+                    glm::vec3 sumR = sumRs[p];
+                    glm::vec3 acceleration = accel[p];
+
                     if (neighborCount > 0) {
                         float avgDist = sumDist / neighborCount;
                         glm::vec3 avgR = sumR / (float) neighborCount;
                         acceleration -= calculateGradient(avgDist, A.mass) * avgR;
 
-                        // Ring Correction
                         if (glm::length(sumR) / sumDist < 0.05f) {
                             acceleration += correction * glm::vec3((distx(gen) - 395.0f) / 790.0f, (disty(gen) - 300.0f) / 600.0f, 0.0f);
                         }
@@ -364,27 +403,7 @@ int main()
                     acceleration *= (3.0f * stiffness) / std::max(density, 0.001f);
                     A.acceleration = (float) scaleCoefficent * acceleration;
                     A.density = density / area;
-                }
-
-                if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
-                    {
-                        double mouseX, mouseY;
-                        glfwGetCursorPos(window, &mouseX, &mouseY);
-                        mouseY = screenSizeY - mouseY;
-                        glm::vec3 mousePos = glm::vec3((float) mouseX, (float) mouseY, 0.0f);
-                        int gridKey = (int) (mouseX / gridSize) + (int) (mouseY / gridSize) * cellsX;
-
-                        for (auto& c : grid[gridKey]) {
-                            auto& P = *objectArray[c];
-                            glm::vec3 direction = glm::normalize(P.position - mousePos);
-                            P.acceleration += scaleCoefficent * mouseForce * direction;
-                        }
-                    }
-
-                // Update Accelerations
-                for (int p = 0; p < objectArray.size(); p++)
-                {
-                    (*objectArray[p]).updatePosition(deltaTime);
+                    A.updatePosition(deltaTime);
                 }
 
                 // Draw
